@@ -199,7 +199,6 @@ func (c *PoolChain) SendWithRetry(
 func (c *PoolChain) ConnectWithRetry(
 	host string,
 	ctx context.Context,
-	rotationSettings *models.RotationSettings,
 	log *logger.Logger,
 ) (net.Conn, int, error) {
 	tried := make(map[int]bool)
@@ -223,7 +222,7 @@ func (c *PoolChain) ConnectWithRetry(
 		)
 
 		// Reuse the existing connectViaProxy logic via a temporary handler
-		conn, err := connectViaProxyStandalone(selectedProxy, host, rotationSettings)
+		conn, err := connectViaProxyStandalone(selectedProxy, host)
 		if err != nil {
 			lastErr = fmt.Errorf("CONNECT proxy %s attempt %d: %w", selectedProxy.Address, attempt+1, err)
 			log.Warn("pool chain CONNECT: failed", "proxy", selectedProxy.Address, "err", err)
@@ -240,22 +239,14 @@ func (c *PoolChain) ConnectWithRetry(
 }
 
 // connectViaProxyStandalone is a standalone version of connectViaProxy (no handler receiver needed).
-func connectViaProxyStandalone(p *models.Proxy, host string, settings *models.RotationSettings) (net.Conn, error) {
-	timeout := 90 * time.Second
-	if settings != nil && settings.Timeout > 0 {
-		timeout = time.Duration(settings.Timeout) * time.Second
-	}
-	if timeout < 30*time.Second {
-		timeout = 30 * time.Second
-	}
-
+func connectViaProxyStandalone(p *models.Proxy, host string) (net.Conn, error) {
 	switch p.Protocol {
 	case "socks5":
 		return connectViaSocks5(p, host)
 	case "socks4", "socks4a":
 		return connectViaSocks4Standalone(p, host)
 	case "http", "https":
-		return connectViaHTTPStandalone(p, host, timeout)
+		return connectViaHTTPStandalone(p, host)
 	default:
 		return nil, fmt.Errorf("unsupported protocol for CONNECT: %s", p.Protocol)
 	}

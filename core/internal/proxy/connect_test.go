@@ -52,7 +52,7 @@ func TestConnectViaHTTPStandalone_Success(t *testing.T) {
 		Protocol: "http",
 	}
 
-	conn, err := connectViaHTTPStandalone(proxy, "example.com:443", 10*time.Second)
+	conn, err := connectViaHTTPStandalone(proxy, "example.com:443")
 	if err != nil {
 		t.Fatalf("connectViaHTTPStandalone: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestConnectViaHTTPStandalone_Rejected(t *testing.T) {
 		Protocol: "http",
 	}
 
-	_, err = connectViaHTTPStandalone(proxy, "example.com:443", 10*time.Second)
+	_, err = connectViaHTTPStandalone(proxy, "example.com:443")
 	if err == nil {
 		t.Fatal("expected error for rejected CONNECT")
 	}
@@ -158,7 +158,7 @@ func TestConnectViaHTTPStandalone_WithAuth(t *testing.T) {
 		Password: &pass,
 	}
 
-	conn, err := connectViaHTTPStandalone(proxy, "example.com:443", 10*time.Second)
+	conn, err := connectViaHTTPStandalone(proxy, "example.com:443")
 	if err != nil {
 		t.Fatalf("expected success with auth, got: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestConnectViaHTTPStandalone_ConnectionRefused(t *testing.T) {
 		Protocol: "http",
 	}
 
-	_, err := connectViaHTTPStandalone(proxy, "example.com:443", 2*time.Second)
+	_, err := connectViaHTTPStandalone(proxy, "example.com:443")
 	if err == nil {
 		t.Fatal("expected error for connection refused")
 	}
@@ -197,9 +197,8 @@ func TestConnectViaProxyStandalone_UnsupportedProtocol(t *testing.T) {
 		Address:  "127.0.0.1:9999",
 		Protocol: "ftp",
 	}
-	settings := &models.RotationSettings{Timeout: 5}
 
-	_, err := connectViaProxyStandalone(proxy, "example.com:443", settings)
+	_, err := connectViaProxyStandalone(proxy, "example.com:443")
 	if err == nil {
 		t.Fatal("expected error for unsupported protocol")
 	}
@@ -237,9 +236,8 @@ func TestConnectViaProxyStandalone_RoutesHTTP(t *testing.T) {
 		Address:  ln.Addr().String(),
 		Protocol: "http",
 	}
-	settings := &models.RotationSettings{Timeout: 10}
 
-	conn, err := connectViaProxyStandalone(proxy, "example.com:443", settings)
+	conn, err := connectViaProxyStandalone(proxy, "example.com:443")
 	if err != nil {
 		t.Fatalf("expected success: %v", err)
 	}
@@ -285,7 +283,7 @@ func TestConnectViaHTTPStandalone_NoOverRead(t *testing.T) {
 		Protocol: "http",
 	}
 
-	conn, err := connectViaHTTPStandalone(proxy, "example.com:443", 10*time.Second)
+	conn, err := connectViaHTTPStandalone(proxy, "example.com:443")
 	if err != nil {
 		t.Fatalf("connectViaHTTPStandalone: %v", err)
 	}

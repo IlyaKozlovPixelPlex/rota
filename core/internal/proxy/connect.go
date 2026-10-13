@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -11,7 +12,16 @@ import (
 	proxyDialer "golang.org/x/net/proxy"
 )
 
+const (
+	// dialTimeout caps the TCP connect phase to the upstream proxy.
+	dialTimeout = 3 * time.Second
+	// connectRespTimeout caps the CONNECT/SOCKS5 handshake after the TCP connection is up.
+	connectRespTimeout = 10 * time.Second
+)
+
 // connectViaSocks5 dials host through a SOCKS5 proxy.
+// dialTimeout covers the TCP connect to the proxy; dialTimeout+connectRespTimeout
+// covers the full SOCKS5 handshake via a context passed to DialContext.
 func connectViaSocks5(p *models.Proxy, host string) (net.Conn, error) {
 	var auth *proxyDialer.Auth
 	if p.Username != nil && *p.Username != "" {
@@ -21,9 +31,19 @@ func connectViaSocks5(p *models.Proxy, host string) (net.Conn, error) {
 		}
 		auth = &proxyDialer.Auth{User: *p.Username, Password: pw}
 	}
-	dialer, err := proxyDialer.SOCKS5("tcp", p.Address, auth, proxyDialer.Direct)
+	forward := &net.Dialer{Timeout: dialTimeout}
+	dialer, err := proxyDialer.SOCKS5("tcp", p.Address, auth, forward)
 	if err != nil {
 		return nil, fmt.Errorf("socks5 dialer: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout+connectRespTimeout)
+	defer cancel()
+	if cd, ok := dialer.(proxyDialer.ContextDialer); ok {
+		conn, err := cd.DialContext(ctx, "tcp", host)
+		if err != nil {
+			return nil, fmt.Errorf("socks5 dial %s via %s: %w", host, p.Address, err)
+		}
+		return conn, nil
 	}
 	conn, err := dialer.Dial("tcp", host)
 	if err != nil {
@@ -33,17 +53,14 @@ func connectViaSocks5(p *models.Proxy, host string) (net.Conn, error) {
 }
 
 // connectViaHTTPStandalone sends a CONNECT request to an HTTP proxy.
-func connectViaHTTPStandalone(p *models.Proxy, host string, timeout time.Duration) (net.Conn, error) {
-	if timeout < 30*time.Second {
-		timeout = 30 * time.Second
-	}
-
-	conn, err := net.DialTimeout("tcp", p.Address, timeout)
+// dialTimeout covers the TCP connect; connectRespTimeout covers the CONNECT handshake.
+func connectViaHTTPStandalone(p *models.Proxy, host string) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", p.Address, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy %s: %w", p.Address, err)
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	_ = conn.SetDeadline(time.Now().Add(connectRespTimeout))
 
 	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", host, host)
 	if p.Username != nil && *p.Username != "" {

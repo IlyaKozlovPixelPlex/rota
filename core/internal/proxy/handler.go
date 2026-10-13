@@ -14,7 +14,6 @@ import (
 	"github.com/alpkeskin/rota/core/internal/models"
 	"github.com/alpkeskin/rota/core/pkg/logger"
 	"github.com/google/uuid"
-	proxyDialer "golang.org/x/net/proxy"
 )
 
 // UpstreamProxyHandler handles requests with upstream proxy rotation
@@ -180,7 +179,7 @@ func (h *UpstreamProxyHandler) HandleConnectRequest(w http.ResponseWriter, r *ht
 
 	reqCtx := r.Context()
 	if chain, ok := reqCtx.Value(UserChainContextKey).(*PoolChain); ok && chain != nil {
-		upstreamConn, proxyID, err = chain.ConnectWithRetry(host, reqCtx, h.getSettings(), h.logger)
+		upstreamConn, proxyID, err = chain.ConnectWithRetry(host, reqCtx, h.logger)
 	} else {
 		upstreamConn, proxyID, err = h.connectThroughProxy(host, reqCtx)
 	}
@@ -513,33 +512,7 @@ func (h *UpstreamProxyHandler) tryConnectWithRetries(selectedProxy *models.Proxy
 func (h *UpstreamProxyHandler) connectViaProxy(proxy *models.Proxy, host string) (net.Conn, error) {
 	switch proxy.Protocol {
 	case "socks5":
-		var dialer proxyDialer.Dialer
-		var err error
-
-		if proxy.Username != nil && *proxy.Username != "" {
-			password := ""
-			if proxy.Password != nil {
-				password = *proxy.Password
-			}
-			auth := &proxyDialer.Auth{
-				User:     *proxy.Username,
-				Password: password,
-			}
-			dialer, err = proxyDialer.SOCKS5("tcp", proxy.Address, auth, proxyDialer.Direct)
-		} else {
-			dialer, err = proxyDialer.SOCKS5("tcp", proxy.Address, nil, proxyDialer.Direct)
-		}
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
-		}
-
-		conn, err := dialer.Dial("tcp", host)
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to %s via SOCKS5 proxy %s: %w", host, proxy.Address, err)
-		}
-
-		return conn, nil
+		return connectViaSocks5(proxy, host)
 
 	case "http", "https":
 		return h.connectViaHTTPProxy(proxy, host)
@@ -549,19 +522,15 @@ func (h *UpstreamProxyHandler) connectViaProxy(proxy *models.Proxy, host string)
 	}
 }
 
-// connectViaHTTPProxy establishes a connection through HTTP proxy using CONNECT method
+// connectViaHTTPProxy establishes a connection through HTTP proxy using CONNECT method.
+// dialTimeout covers the TCP connect; connectRespTimeout covers the CONNECT handshake.
 func (h *UpstreamProxyHandler) connectViaHTTPProxy(proxy *models.Proxy, host string) (net.Conn, error) {
-	timeout := time.Duration(h.getSettings().Timeout) * time.Second
-	if timeout < 60*time.Second {
-		timeout = 60 * time.Second
-	}
-
-	conn, err := net.DialTimeout("tcp", proxy.Address, timeout)
+	conn, err := net.DialTimeout("tcp", proxy.Address, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to proxy %s: %w", proxy.Address, err)
 	}
 
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(connectRespTimeout)); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to set connection deadline: %w", err)
 	}
