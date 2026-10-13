@@ -14,23 +14,13 @@ import (
 	"h12.io/socks"
 )
 
-// chainFailureThreshold is the number of consecutive failures a proxy must
-// accumulate within a chain before it is evicted from its pool (AUD-11).
-const chainFailureThreshold = 3
-
 // PoolChain holds an ordered list of pool selectors for a user:
 // index 0 = main pool, index 1..N = fallback pools.
-// It refreshes pool selectors periodically and provides the high-level
-// SendWithRetry / ConnectWithRetry methods used by the proxy handler.
+// Failure tracking and quarantine live in each PoolSelector.
 type PoolChain struct {
 	selectors []*PoolSelector
 	logger    *logger.Logger
 	maxRetry  int // total upstream attempts across all pools
-
-	// failCounts tracks consecutive failures per proxy id so a single transient
-	// error doesn't evict an otherwise-healthy proxy (AUD-11).
-	mu         sync.Mutex
-	failCounts map[int]int
 }
 
 // NewPoolChain builds a PoolChain from an ordered list of ProxyPool objects.
@@ -40,10 +30,9 @@ func NewPoolChain(db *database.DB, pools []models.ProxyPool, maxRetry int, log *
 		selectors = append(selectors, NewPoolSelector(db, p))
 	}
 	return &PoolChain{
-		selectors:  selectors,
-		logger:     log,
-		maxRetry:   maxRetry,
-		failCounts: make(map[int]int),
+		selectors: selectors,
+		logger:    log,
+		maxRetry:  maxRetry,
 	}
 }
 
@@ -82,33 +71,6 @@ func (c *PoolChain) pickProxy(ctx context.Context, tried map[int]bool) (*models.
 		}
 	}
 	return nil, -1, fmt.Errorf("no untried proxies available across all pools")
-}
-
-// markFailed records a failure for the proxy and only removes it from its pool's
-// in-memory list after chainFailureThreshold consecutive failures, so transient
-// timeouts don't immediately evict a healthy proxy (AUD-11).
-func (c *PoolChain) markFailed(selIdx int, proxyID int) {
-	c.mu.Lock()
-	c.failCounts[proxyID]++
-	count := c.failCounts[proxyID]
-	if count >= chainFailureThreshold {
-		delete(c.failCounts, proxyID)
-	}
-	c.mu.Unlock()
-
-	if count < chainFailureThreshold {
-		return
-	}
-	if selIdx >= 0 && selIdx < len(c.selectors) {
-		c.selectors[selIdx].RemoveProxy(proxyID)
-	}
-}
-
-// markSucceeded resets the consecutive-failure counter for a proxy.
-func (c *PoolChain) markSucceeded(proxyID int) {
-	c.mu.Lock()
-	delete(c.failCounts, proxyID)
-	c.mu.Unlock()
 }
 
 // SendWithRetry attempts to forward an HTTP request through the chain.
@@ -180,11 +142,11 @@ func (c *PoolChain) SendWithRetry(
 			}
 			lastErr = fmt.Errorf("proxy %s attempt %d: %w", selectedProxy.Address, attempt+1, err)
 			log.Warn("pool chain: proxy failed", "proxy", selectedProxy.Address, "err", err)
-			c.markFailed(selIdx, selectedProxy.ID)
+			c.selectors[selIdx].ReportFailure(selectedProxy.ID)
 			continue
 		}
 
-		c.markSucceeded(selectedProxy.ID)
+		c.selectors[selIdx].ReportSuccess(selectedProxy.ID)
 		log.Info("pool chain: success",
 			"proxy", selectedProxy.Address,
 			"status", resp.StatusCode,
@@ -226,11 +188,11 @@ func (c *PoolChain) ConnectWithRetry(
 		if err != nil {
 			lastErr = fmt.Errorf("CONNECT proxy %s attempt %d: %w", selectedProxy.Address, attempt+1, err)
 			log.Warn("pool chain CONNECT: failed", "proxy", selectedProxy.Address, "err", err)
-			c.markFailed(selIdx, selectedProxy.ID)
+			c.selectors[selIdx].ReportFailure(selectedProxy.ID)
 			continue
 		}
 
-		c.markSucceeded(selectedProxy.ID)
+		c.selectors[selIdx].ReportSuccess(selectedProxy.ID)
 		log.Info("pool chain CONNECT: success", "proxy", selectedProxy.Address, "host", host)
 		return conn, selectedProxy.ID, nil
 	}

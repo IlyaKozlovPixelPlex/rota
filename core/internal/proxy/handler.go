@@ -16,6 +16,56 @@ import (
 	"github.com/google/uuid"
 )
 
+// proxyQuarantine is a lightweight per-handler quarantine tracker for the legacy
+// selection path. It mirrors the logic in PoolSelector but operates independently
+// from the pool-chain path (no shared selector instance to embed it into).
+type proxyQuarantine struct {
+	mu         sync.Mutex
+	failCounts map[int]int
+	banCounts  map[int]int
+	until      map[int]time.Time
+}
+
+func newProxyQuarantine() *proxyQuarantine {
+	return &proxyQuarantine{
+		failCounts: make(map[int]int),
+		banCounts:  make(map[int]int),
+		until:      make(map[int]time.Time),
+	}
+}
+
+func (q *proxyQuarantine) reportFailure(id int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.failCounts[id]++
+	if q.failCounts[id] < chainFailureThreshold {
+		return
+	}
+	q.failCounts[id] = 0
+	bans := q.banCounts[id]
+	q.banCounts[id]++
+	backoff := quarantineBase << uint(bans)
+	if backoff > quarantineMax {
+		backoff = quarantineMax
+	}
+	q.until[id] = time.Now().Add(backoff)
+}
+
+func (q *proxyQuarantine) reportSuccess(id int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	delete(q.failCounts, id)
+	delete(q.until, id)
+	delete(q.banCounts, id)
+}
+
+func (q *proxyQuarantine) isQuarantined(id int) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	until, ok := q.until[id]
+	return ok && time.Now().Before(until)
+}
+
 // UpstreamProxyHandler handles requests with upstream proxy rotation
 type UpstreamProxyHandler struct {
 	// mu guards selector and settings, which are hot-swapped by
@@ -26,6 +76,7 @@ type UpstreamProxyHandler struct {
 	tracker         *UsageTracker
 	logger          *logger.Logger
 	removeUnhealthy bool
+	quarantine      *proxyQuarantine
 }
 
 // getSettings returns the current rotation settings under the read lock.
@@ -69,6 +120,7 @@ func NewUpstreamProxyHandler(
 		settings:        settings,
 		logger:          log,
 		removeUnhealthy: settings.RemoveUnhealthy,
+		quarantine:      newProxyQuarantine(),
 	}
 }
 
@@ -328,7 +380,8 @@ func (h *UpstreamProxyHandler) sendWithRetry(req *http.Request, ctx context.Cont
 			return nil, 0, fmt.Errorf("no proxy available: %w", err)
 		}
 
-		if triedProxies[selectedProxy.ID] {
+		if triedProxies[selectedProxy.ID] || h.quarantine.isQuarantined(selectedProxy.ID) {
+			triedProxies[selectedProxy.ID] = true
 			continue
 		}
 		triedProxies[selectedProxy.ID] = true
@@ -342,6 +395,7 @@ func (h *UpstreamProxyHandler) sendWithRetry(req *http.Request, ctx context.Cont
 
 		resp, err := h.tryProxyWithRetries(req, ctx, selectedProxy, perProxyRetries)
 		if err != nil {
+			h.quarantine.reportFailure(selectedProxy.ID)
 			lastErr = fmt.Errorf("proxy %s failed after %d retries: %w", selectedProxy.Address, perProxyRetries, err)
 			h.logger.Warn("proxy failed after all retries",
 				"source", "proxy",
@@ -373,6 +427,7 @@ func (h *UpstreamProxyHandler) sendWithRetry(req *http.Request, ctx context.Cont
 			continue
 		}
 
+		h.quarantine.reportSuccess(selectedProxy.ID)
 		return resp, selectedProxy.ID, nil
 	}
 
@@ -453,7 +508,8 @@ func (h *UpstreamProxyHandler) connectThroughProxy(host string, ctx context.Cont
 			return nil, 0, fmt.Errorf("no proxy available: %w", err)
 		}
 
-		if triedProxies[selectedProxy.ID] {
+		if triedProxies[selectedProxy.ID] || h.quarantine.isQuarantined(selectedProxy.ID) {
+			triedProxies[selectedProxy.ID] = true
 			continue
 		}
 		triedProxies[selectedProxy.ID] = true
@@ -462,6 +518,7 @@ func (h *UpstreamProxyHandler) connectThroughProxy(host string, ctx context.Cont
 		duration := int(time.Since(startTime).Milliseconds())
 
 		if err != nil {
+			h.quarantine.reportFailure(selectedProxy.ID)
 			lastErr = fmt.Errorf("proxy %s failed after %d retries: %w", selectedProxy.Address, perProxyRetries, err)
 
 			go func(proxyID int, proxyAddr string, failedDuration int, failErr error) {
@@ -483,6 +540,7 @@ func (h *UpstreamProxyHandler) connectThroughProxy(host string, ctx context.Cont
 			continue
 		}
 
+		h.quarantine.reportSuccess(selectedProxy.ID)
 		return conn, selectedProxy.ID, nil
 	}
 

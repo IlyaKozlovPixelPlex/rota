@@ -5,13 +5,25 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sync"
+	"time"
 
 	"github.com/alpkeskin/rota/core/internal/database"
 	"github.com/alpkeskin/rota/core/internal/models"
 )
 
+const (
+	// chainFailureThreshold is the number of consecutive failures before a proxy
+	// enters quarantine (was in pool_chain.go, now owned by the selector layer).
+	chainFailureThreshold = 3
+	// quarantineBase is the cooldown duration for the first quarantine epoch.
+	// Each subsequent ban doubles it: 30s → 60s → 120s … up to quarantineMax.
+	quarantineBase = 30 * time.Second
+	// quarantineMax caps the exponential backoff.
+	quarantineMax = time.Hour
+)
+
 // PoolSelector selects a proxy from a specific pool using the pool's rotation strategy.
-// It keeps in-memory state (round-robin index, stick counters) per pool instance.
+// It keeps in-memory state (round-robin index, stick counters, quarantine) per pool instance.
 type PoolSelector struct {
 	db     *database.DB
 	poolID int
@@ -23,15 +35,24 @@ type PoolSelector struct {
 	rrIdx       int
 	stickIdx    int
 	stickServed int
+
+	// Quarantine state: proxies that exceed chainFailureThreshold consecutive
+	// failures are placed in a time-based cooldown with exponential backoff.
+	failCounts map[int]int       // consecutive failures since last success
+	banCounts  map[int]int       // total quarantine epochs (drives backoff exponent)
+	quarantine map[int]time.Time // quarantineUntil per proxy ID
 }
 
 // NewPoolSelector creates a PoolSelector for the given pool.
 func NewPoolSelector(db *database.DB, pool models.ProxyPool) *PoolSelector {
 	return &PoolSelector{
-		db:     db,
-		poolID: pool.ID,
-		method: pool.RotationMethod,
-		stick:  pool.StickCount,
+		db:         db,
+		poolID:     pool.ID,
+		method:     pool.RotationMethod,
+		stick:      pool.StickCount,
+		failCounts: make(map[int]int),
+		banCounts:  make(map[int]int),
+		quarantine: make(map[int]time.Time),
 	}
 }
 
@@ -76,6 +97,18 @@ func (ps *PoolSelector) Refresh(ctx context.Context) error {
 		ps.stickIdx = 0
 		ps.stickServed = 0
 	}
+	// prune quarantine state for proxies no longer in the pool
+	live := make(map[int]struct{}, len(proxies))
+	for _, p := range proxies {
+		live[p.ID] = struct{}{}
+	}
+	for id := range ps.quarantine {
+		if _, ok := live[id]; !ok {
+			delete(ps.quarantine, id)
+			delete(ps.failCounts, id)
+			delete(ps.banCounts, id)
+		}
+	}
 	ps.mu.Unlock()
 	return nil
 }
@@ -87,7 +120,8 @@ func (ps *PoolSelector) HasActive() bool {
 	return len(ps.proxies) > 0
 }
 
-// Select picks the next proxy according to the pool's rotation method.
+// Select picks the next proxy according to the pool's rotation method,
+// skipping any proxy whose quarantine period has not yet expired.
 func (ps *PoolSelector) Select(_ context.Context) (*models.Proxy, error) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -96,58 +130,90 @@ func (ps *PoolSelector) Select(_ context.Context) (*models.Proxy, error) {
 		return nil, fmt.Errorf("pool %d has no active proxies", ps.poolID)
 	}
 
+	now := time.Now()
+	n := len(ps.proxies)
+
 	switch ps.method {
 	case "random":
-		// math/rand/v2: per-goroutine, lock-free; crypto randomness isn't needed
-		// for pool load balancing (matches RandomSelector).
-		return ps.proxies[rand.IntN(len(ps.proxies))], nil
+		// Build a list of non-quarantined proxies and pick at random.
+		available := make([]*models.Proxy, 0, n)
+		for _, p := range ps.proxies {
+			if until, ok := ps.quarantine[p.ID]; !ok || now.After(until) {
+				available = append(available, p)
+			}
+		}
+		if len(available) == 0 {
+			return nil, fmt.Errorf("pool %d: all %d proxies quarantined", ps.poolID, n)
+		}
+		return available[rand.IntN(len(available))], nil
 
 	case "stick":
-		p := ps.proxies[ps.stickIdx]
-		ps.stickServed++
 		if ps.stick <= 0 {
 			ps.stick = 10
 		}
-		if ps.stickServed >= ps.stick {
-			// advance to next proxy round-robin style
-			ps.stickIdx = (ps.stickIdx + 1) % len(ps.proxies)
-			ps.stickServed = 0
+		start := ps.stickIdx
+		for i := 0; i < n; i++ {
+			idx := (start + i) % n
+			p := ps.proxies[idx]
+			if until, ok := ps.quarantine[p.ID]; ok && now.Before(until) {
+				continue
+			}
+			// If we jumped past the intended stickIdx, reset the served count.
+			if idx != ps.stickIdx {
+				ps.stickIdx = idx
+				ps.stickServed = 0
+			}
+			ps.stickServed++
+			if ps.stickServed >= ps.stick {
+				ps.stickIdx = (idx + 1) % n
+				ps.stickServed = 0
+			}
+			return p, nil
 		}
-		return p, nil
+		return nil, fmt.Errorf("pool %d: all %d proxies quarantined", ps.poolID, n)
 
 	default: // roundrobin
-		p := ps.proxies[ps.rrIdx]
-		ps.rrIdx = (ps.rrIdx + 1) % len(ps.proxies)
-		return p, nil
+		start := ps.rrIdx
+		for i := 0; i < n; i++ {
+			idx := (start + i) % n
+			p := ps.proxies[idx]
+			if until, ok := ps.quarantine[p.ID]; ok && now.Before(until) {
+				continue
+			}
+			ps.rrIdx = (idx + 1) % n
+			return p, nil
+		}
+		return nil, fmt.Errorf("pool %d: all %d proxies quarantined", ps.poolID, n)
 	}
 }
 
-// RemoveProxy removes a specific proxy from the in-memory list (called after failure).
-func (ps *PoolSelector) RemoveProxy(proxyID int) {
+// ReportFailure records a connection failure for the given proxy.
+// After chainFailureThreshold consecutive failures the proxy enters quarantine
+// with an exponential backoff: 30s → 60s → 120s … capped at quarantineMax.
+// The proxy remains in ps.proxies so it recovers automatically once the cooldown expires.
+func (ps *PoolSelector) ReportFailure(proxyID int) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-
-	filtered := ps.proxies[:0]
-	for _, p := range ps.proxies {
-		if p.ID != proxyID {
-			filtered = append(filtered, p)
-		}
+	ps.failCounts[proxyID]++
+	if ps.failCounts[proxyID] < chainFailureThreshold {
+		return
 	}
-	ps.proxies = filtered
-
-	// fix indices
-	n := len(ps.proxies)
-	if n == 0 {
-		ps.rrIdx = 0
-		ps.stickIdx = 0
-		ps.stickServed = 0
-	} else {
-		if ps.rrIdx >= n {
-			ps.rrIdx = 0
-		}
-		if ps.stickIdx >= n {
-			ps.stickIdx = 0
-			ps.stickServed = 0
-		}
+	ps.failCounts[proxyID] = 0
+	bans := ps.banCounts[proxyID]
+	ps.banCounts[proxyID]++
+	backoff := quarantineBase << uint(bans)
+	if backoff > quarantineMax {
+		backoff = quarantineMax
 	}
+	ps.quarantine[proxyID] = time.Now().Add(backoff)
+}
+
+// ReportSuccess clears failure state and any active quarantine for the proxy.
+// banCounts is also reset so a recovered proxy starts fresh on the next failure.
+func (ps *PoolSelector) ReportSuccess(proxyID int) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	delete(ps.failCounts, proxyID)
+	delete(ps.quarantine, proxyID)
+	delete(ps.banCounts, proxyID)
 }
