@@ -257,6 +257,10 @@ func (s *Server) setupRoutes() {
 	// ── Fully public routes ────────────────────────────────────────────────
 	s.router.Get("/health", s.healthHandler.Health)
 
+	// Prometheus scrape endpoint — unauthenticated, same as /health.
+	// Scraped by Prometheus on the admin port (8001), not the proxy data-plane (8000).
+	s.router.Handle("/metrics", proxy.MetricsHandler())
+
 	// API Documentation (public — read-only reference)
 	s.router.Get("/docs", s.documentationHandler.ServeDocumentation)
 	s.router.Get("/api/v1/swagger.json", s.serveSwaggerJSON)

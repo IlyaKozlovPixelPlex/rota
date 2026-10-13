@@ -143,10 +143,19 @@ func (h *UpstreamProxyHandler) HandleHTTPRequest(w http.ResponseWriter, r *http.
 	// --- Pool-aware path: if a PoolChain was attached by UserAuthMiddleware, use it ---
 	reqCtx := r.Context()
 	if chain, ok := reqCtx.Value(UserChainContextKey).(*PoolChain); ok && chain != nil {
-		resp, proxyID, err := chain.SendWithRetry(r, reqCtx, h.getSettings(), h.logger)
+		username, _ := reqCtx.Value(UserNameContextKey).(string)
+		resp, proxyID, proxyAddr, err := chain.SendWithRetry(r, reqCtx, h.getSettings(), h.logger)
 		duration := int(time.Since(startTime).Milliseconds())
+		if proxyAddr != "" {
+			result := "success"
+			if err != nil {
+				result = "fail"
+				pmetrics.upstreamFailTotal.WithLabelValues(proxyAddr).Inc()
+			}
+			pmetrics.requestsTotal.WithLabelValues(proxyAddr, username, result).Inc()
+		}
 		if proxyID > 0 {
-			h.recordAsync(proxyID, "", r.URL.String(), r.Method, resp, err, duration, startTime)
+			h.recordAsync(proxyID, proxyAddr, r.URL.String(), r.Method, resp, err, duration, startTime)
 		}
 		if err != nil {
 			h.logger.Error("pool-chain request failed", "request_id", requestID, "error", err)
@@ -227,13 +236,15 @@ func (h *UpstreamProxyHandler) HandleConnectRequest(w http.ResponseWriter, r *ht
 	// Establish upstream connection (pool-chain or global)
 	var upstreamConn net.Conn
 	var proxyID int
+	var proxyAddr string
 	var err error
 
 	reqCtx := r.Context()
+	username, _ := reqCtx.Value(UserNameContextKey).(string)
 	if chain, ok := reqCtx.Value(UserChainContextKey).(*PoolChain); ok && chain != nil {
-		upstreamConn, proxyID, err = chain.ConnectWithRetry(host, reqCtx, h.logger)
+		upstreamConn, proxyID, proxyAddr, err = chain.ConnectWithRetry(host, reqCtx, h.logger)
 	} else {
-		upstreamConn, proxyID, err = h.connectThroughProxy(host, reqCtx)
+		upstreamConn, proxyID, proxyAddr, err = h.connectThroughProxy(host, reqCtx)
 	}
 
 	if err != nil {
@@ -278,10 +289,23 @@ func (h *UpstreamProxyHandler) HandleConnectRequest(w http.ResponseWriter, r *ht
 
 	// Measure time-to-establish before the (long-lived) tunnel copy.
 	duration := int(time.Since(startTime).Milliseconds())
+	if proxyAddr != "" {
+		pmetrics.connectLatency.WithLabelValues(proxyAddr).Observe(time.Since(startTime).Seconds())
+		pmetrics.activeTunnels.Inc()
+	}
 
 	// Bidirectional copy — uses splice(2) on Linux for zero-copy. This blocks
 	// until either direction closes or errors.
 	copyErr := BidirectionalCopy(clientConn, upstreamConn)
+
+	if proxyAddr != "" {
+		pmetrics.activeTunnels.Dec()
+		result := "success"
+		if copyErr != nil {
+			result = "fail"
+		}
+		pmetrics.requestsTotal.WithLabelValues(proxyAddr, username, result).Inc()
+	}
 
 	// Record the CONNECT outcome based on the copy result: a tunnel that fails
 	// immediately must not be logged as a success (AUD-37). A healthy tunnel
@@ -292,7 +316,7 @@ func (h *UpstreamProxyHandler) HandleConnectRequest(w http.ResponseWriter, r *ht
 			defer cancel()
 			record := RequestRecord{
 				ProxyID:      proxyID,
-				ProxyAddress: "",
+				ProxyAddress: proxyAddr,
 				RequestedURL: "CONNECT://" + host,
 				Method:       "CONNECT",
 				Success:      copyErr == nil,
@@ -396,6 +420,8 @@ func (h *UpstreamProxyHandler) sendWithRetry(req *http.Request, ctx context.Cont
 		resp, err := h.tryProxyWithRetries(req, ctx, selectedProxy, perProxyRetries)
 		if err != nil {
 			h.quarantine.reportFailure(selectedProxy.ID)
+			pmetrics.upstreamFailTotal.WithLabelValues(selectedProxy.Address).Inc()
+			pmetrics.requestsTotal.WithLabelValues(selectedProxy.Address, "", "fail").Inc()
 			lastErr = fmt.Errorf("proxy %s failed after %d retries: %w", selectedProxy.Address, perProxyRetries, err)
 			h.logger.Warn("proxy failed after all retries",
 				"source", "proxy",
@@ -428,6 +454,7 @@ func (h *UpstreamProxyHandler) sendWithRetry(req *http.Request, ctx context.Cont
 		}
 
 		h.quarantine.reportSuccess(selectedProxy.ID)
+		pmetrics.requestsTotal.WithLabelValues(selectedProxy.Address, "", "success").Inc()
 		return resp, selectedProxy.ID, nil
 	}
 
@@ -482,8 +509,9 @@ func (h *UpstreamProxyHandler) tryProxyWithRetries(req *http.Request, ctx contex
 	return nil, lastErr
 }
 
-// connectThroughProxy establishes a connection through upstream proxy with retry logic
-func (h *UpstreamProxyHandler) connectThroughProxy(host string, ctx context.Context) (net.Conn, int, error) {
+// connectThroughProxy establishes a connection through upstream proxy with retry logic.
+// Returns (conn, proxyID, proxyAddress, error).
+func (h *UpstreamProxyHandler) connectThroughProxy(host string, ctx context.Context) (net.Conn, int, string, error) {
 	startTime := time.Now()
 
 	settings := h.getSettings()
@@ -505,7 +533,7 @@ func (h *UpstreamProxyHandler) connectThroughProxy(host string, ctx context.Cont
 	for fallbackAttempt := 0; fallbackAttempt < maxFallbackRetries; fallbackAttempt++ {
 		selectedProxy, err := selector.Select(ctx)
 		if err != nil {
-			return nil, 0, fmt.Errorf("no proxy available: %w", err)
+			return nil, 0, "", fmt.Errorf("no proxy available: %w", err)
 		}
 
 		if triedProxies[selectedProxy.ID] || h.quarantine.isQuarantined(selectedProxy.ID) {
@@ -519,6 +547,8 @@ func (h *UpstreamProxyHandler) connectThroughProxy(host string, ctx context.Cont
 
 		if err != nil {
 			h.quarantine.reportFailure(selectedProxy.ID)
+			pmetrics.upstreamFailTotal.WithLabelValues(selectedProxy.Address).Inc()
+			pmetrics.requestsTotal.WithLabelValues(selectedProxy.Address, "", "fail").Inc()
 			lastErr = fmt.Errorf("proxy %s failed after %d retries: %w", selectedProxy.Address, perProxyRetries, err)
 
 			go func(proxyID int, proxyAddr string, failedDuration int, failErr error) {
@@ -541,10 +571,13 @@ func (h *UpstreamProxyHandler) connectThroughProxy(host string, ctx context.Cont
 		}
 
 		h.quarantine.reportSuccess(selectedProxy.ID)
-		return conn, selectedProxy.ID, nil
+		// connectLatency and activeTunnels are recorded by the caller (HandleConnectRequest)
+		// after the 200 CE is sent, so the tunnel-establishment window is measured correctly.
+		_ = duration
+		return conn, selectedProxy.ID, selectedProxy.Address, nil
 	}
 
-	return nil, 0, fmt.Errorf("all proxies failed for CONNECT, last error: %w", lastErr)
+	return nil, 0, "", fmt.Errorf("all proxies failed for CONNECT, last error: %w", lastErr)
 }
 
 // tryConnectWithRetries attempts to connect through a specific proxy with retries

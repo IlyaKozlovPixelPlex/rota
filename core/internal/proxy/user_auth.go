@@ -26,6 +26,12 @@ type userChainKey struct{}
 // UserChainContextKey is exported for use in the handler.
 var UserChainContextKey = userChainKey{}
 
+// userNameKey is the context key that carries the authenticated proxy username.
+type userNameKey struct{}
+
+// UserNameContextKey is exported for use in the handler (e.g. Prometheus labels).
+var UserNameContextKey = userNameKey{}
+
 // userEntry caches a resolved PoolChain and a fast password verifier for a user.
 type userEntry struct {
 	chain     *PoolChain
@@ -133,8 +139,9 @@ func (m *UserAuthMiddleware) HandleRequest(req *http.Request) (*http.Request, *h
 		return req, unauthorized()
 	}
 
-	// Attach chain to context and strip the Proxy-Authorization header
+	// Attach chain and username to context, then strip the auth header.
 	newCtx := context.WithValue(req.Context(), UserChainContextKey, chain)
+	newCtx = context.WithValue(newCtx, UserNameContextKey, username)
 	req = req.WithContext(newCtx)
 	req.Header.Del("Proxy-Authorization")
 	return req, nil
