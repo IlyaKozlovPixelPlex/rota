@@ -14,9 +14,9 @@ import (
 
 // SourceHandler handles proxy source CRUD + manual fetch
 type SourceHandler struct {
-	sourceRepo  *repository.SourceRepository
-	sourceSvc   *services.SourceService
-	logger      *logger.Logger
+	sourceRepo *repository.SourceRepository
+	sourceSvc  *services.SourceService
+	logger     *logger.Logger
 }
 
 // NewSourceHandler creates a new SourceHandler
@@ -132,7 +132,7 @@ func (h *SourceHandler) FetchNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"source":  src,
+		"source":   src,
 		"imported": count,
 	})
 }

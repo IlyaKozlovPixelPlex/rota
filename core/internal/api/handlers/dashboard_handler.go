@@ -26,6 +26,7 @@ func NewDashboardHandler(dashboardRepo *repository.DashboardRepository, proxyRep
 }
 
 // GetStats handles dashboard statistics requests
+//
 //	@Summary		Dashboard statistics
 //	@Description	Get dashboard statistics including proxy and request metrics
 //	@Tags			dashboard
@@ -45,6 +46,7 @@ func (h *DashboardHandler) GetStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetResponseTimeChart handles response time chart requests
+//
 //	@Summary		Response time chart
 //	@Description	Get response time chart data for visualization
 //	@Tags			dashboard
@@ -74,6 +76,7 @@ func (h *DashboardHandler) GetResponseTimeChart(w http.ResponseWriter, r *http.R
 }
 
 // GetSuccessRateChart handles success rate chart requests
+//
 //	@Summary		Success rate chart
 //	@Description	Get success rate chart data for visualization
 //	@Tags			dashboard

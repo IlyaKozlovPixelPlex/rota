@@ -28,6 +28,7 @@ func NewLogsHandler(logRepo *repository.LogRepository, log *logger.Logger) *Logs
 }
 
 // List handles log listing with pagination and filters
+//
 //	@Summary		List logs
 //	@Description	Get paginated list of system logs with optional filters
 //	@Tags			logs
@@ -95,6 +96,7 @@ func (h *LogsHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 // Export handles log export
+//
 //	@Summary		Export logs
 //	@Description	Export system logs in various formats (txt, json)
 //	@Tags			logs

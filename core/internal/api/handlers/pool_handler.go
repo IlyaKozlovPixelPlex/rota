@@ -331,10 +331,10 @@ func (h *PoolHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]interface{}{
-		"job_id":   job.ID,
-		"pool_id":  id,
-		"total":    job.Total,
-		"status":   job.Status,
+		"job_id":  job.ID,
+		"pool_id": id,
+		"total":   job.Total,
+		"status":  job.Status,
 	})
 }
 

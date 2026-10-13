@@ -213,5 +213,3 @@ func (h *UserHandler) ExportWorkingProxies(w http.ResponseWriter, r *http.Reques
 		fmt.Fprintln(w, line)
 	}
 }
-
-

@@ -41,6 +41,7 @@ func (h *SettingsHandler) SetOnUpdate(fn func(ctx context.Context)) {
 }
 
 // Get handles getting current configuration
+//
 //	@Summary		Get settings
 //	@Description	Get current system configuration
 //	@Tags			settings
@@ -63,6 +64,7 @@ func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 // Update handles updating configuration
+//
 //	@Summary		Update settings
 //	@Description	Update system configuration
 //	@Tags			settings
@@ -136,6 +138,7 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 }
 
 // Reset handles resetting configuration to defaults
+//
 //	@Summary		Reset settings
 //	@Description	Reset configuration to default values
 //	@Tags			settings

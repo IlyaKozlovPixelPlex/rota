@@ -32,6 +32,7 @@ func NewAuthHandler(settingsRepo *repository.SettingsRepository, adminRepo *repo
 }
 
 // Login handles user login for dashboard/API access
+//
 //	@Summary		User login
 //	@Description	Authenticate user and receive JWT token
 //	@Tags			auth
