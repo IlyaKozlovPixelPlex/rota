@@ -2,7 +2,12 @@ package proxy
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,13 +18,7 @@ import (
 	"github.com/alpkeskin/rota/core/internal/models"
 	"github.com/alpkeskin/rota/core/internal/repository"
 	"github.com/alpkeskin/rota/core/pkg/logger"
-	"golang.org/x/crypto/bcrypt"
 )
-
-// bcryptCompare is a thin wrapper so the hot-path resolve() doesn't need a DB call.
-func bcryptCompare(hash, password string) error {
-	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-}
 
 // userChainKey is the context key that carries the resolved *PoolChain.
 type userChainKey struct{}
@@ -27,14 +26,14 @@ type userChainKey struct{}
 // UserChainContextKey is exported for use in the handler.
 var UserChainContextKey = userChainKey{}
 
-// userEntry caches a resolved PoolChain and the verified password hash for a user.
-// This avoids bcrypt on every request — bcrypt only runs on first auth or after TTL expiry.
+// userEntry caches a resolved PoolChain and a fast password verifier for a user.
 type userEntry struct {
 	chain     *PoolChain
 	expiresAt time.Time
-	// passwordHash is the bcrypt hash we verified against. If the user changes their
-	// password the hash changes, causing a cache miss on next TTL expiry.
-	verifiedPwHash string
+	// verifiedHMAC is HMAC-SHA256(plaintext_password, per-process secret) stored on
+	// a successful slow-path auth. Fast-path checks compare the incoming password's
+	// HMAC against this value via constant-time comparison — bcrypt never runs on hits.
+	verifiedHMAC string
 }
 
 // UserAuthMiddleware resolves Proxy-Authorization credentials against proxy_users.
@@ -50,6 +49,10 @@ type UserAuthMiddleware struct {
 
 	// legacy fallback (original single-user auth)
 	legacy *AuthMiddleware
+
+	// secret is a random per-process key used to compute HMAC verifiers in cache entries.
+	// It is generated once at startup; restarting the process invalidates all cached HMACs.
+	secret []byte
 
 	// cache: username -> userEntry (TTL 60s)
 	mu    sync.RWMutex
@@ -70,6 +73,10 @@ func NewUserAuthMiddleware(
 	rotSettings *models.RotationSettings,
 	log *logger.Logger,
 ) *UserAuthMiddleware {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		panic("rota: failed to generate HMAC secret: " + err.Error())
+	}
 	m := &UserAuthMiddleware{
 		userRepo:    userRepo,
 		poolRepo:    poolRepo,
@@ -77,6 +84,7 @@ func NewUserAuthMiddleware(
 		legacy:      legacy,
 		rotSettings: rotSettings,
 		logger:      log,
+		secret:      secret,
 		cache:       make(map[string]userEntry),
 	}
 	// background goroutine: refresh all cached chains every 30s
@@ -137,11 +145,17 @@ func (m *UserAuthMiddleware) HandleConnect(req *http.Request) (*http.Request, *h
 	return m.HandleRequest(req)
 }
 
+// computeHMAC returns hex(HMAC-SHA256(password, m.secret)).
+func (m *UserAuthMiddleware) computeHMAC(password string) string {
+	mac := hmac.New(sha256.New, m.secret)
+	mac.Write([]byte(password))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // resolve authenticates the user and returns a warm PoolChain.
-// bcrypt is only called on first auth or after the cache TTL expires (60s).
-// On cache hits the incoming password is compared directly against the cached
-// bcrypt hash using bcrypt.CompareHashAndPassword — but this only happens once
-// per 60-second window, not on every request.
+// bcrypt runs only on a cache miss or after the 60-second TTL expires.
+// On cache hits the incoming password is verified by comparing its HMAC-SHA256
+// against the HMAC stored at slow-path time — constant-time, no bcrypt cost.
 func (m *UserAuthMiddleware) resolve(ctx context.Context, username, password string) (*PoolChain, error) {
 	now := time.Now()
 
@@ -151,11 +165,8 @@ func (m *UserAuthMiddleware) resolve(ctx context.Context, username, password str
 	m.mu.RUnlock()
 
 	if hit && now.Before(entry.expiresAt) {
-		// Verify password against the cached hash — no DB round-trip, no new bcrypt work.
-		// bcrypt.CompareHashAndPassword is still ~30ms but we avoid the DB SELECT.
-		// For even higher throughput, consider storing a fast HMAC of password+secret
-		// instead — but bcrypt cache is sufficient for most workloads.
-		if err := bcryptCompare(entry.verifiedPwHash, password); err != nil {
+		incoming := m.computeHMAC(password)
+		if subtle.ConstantTimeCompare([]byte(incoming), []byte(entry.verifiedHMAC)) != 1 {
 			return nil, fmt.Errorf("invalid credentials")
 		}
 		return entry.chain, nil
@@ -174,9 +185,9 @@ func (m *UserAuthMiddleware) resolve(ctx context.Context, username, password str
 
 	m.mu.Lock()
 	m.cache[username] = userEntry{
-		chain:          chain,
-		expiresAt:      now.Add(60 * time.Second),
-		verifiedPwHash: user.PasswordHash,
+		chain:        chain,
+		expiresAt:    now.Add(60 * time.Second),
+		verifiedHMAC: m.computeHMAC(password),
 	}
 	m.mu.Unlock()
 
