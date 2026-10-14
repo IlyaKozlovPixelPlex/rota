@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"net/http"
+	"os"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -71,9 +73,35 @@ func newProxyMetrics() *proxyMetrics {
 	}
 }
 
-// MetricsHandler returns an http.Handler that serves Prometheus metrics for
-// the proxy layer. Mount it on the admin/API server (port 8001), not the
-// proxy data-plane (port 8000).
+// MetricsHandler returns an http.Handler that serves Prometheus metrics.
+// Mount it on the admin/API server (port 8001), not the proxy data-plane (8000).
+//
+// Access control:
+//   - If METRICS_BASIC_USER and METRICS_BASIC_PASSWORD are both set, the handler
+//     enforces HTTP basic auth (constant-time comparison).
+//   - If either variable is unset or empty, every request gets 403 (closed by default).
+//
+// Called once at startup; env vars are read here and captured in the closure.
 func MetricsHandler() http.Handler {
-	return promhttp.HandlerFor(pmetrics.registry, promhttp.HandlerOpts{})
+	user := os.Getenv("METRICS_BASIC_USER")
+	pass := os.Getenv("METRICS_BASIC_PASSWORD")
+
+	if user == "" || pass == "" {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "metrics endpoint disabled: set METRICS_BASIC_USER and METRICS_BASIC_PASSWORD", http.StatusForbidden)
+		})
+	}
+
+	inner := promhttp.HandlerFor(pmetrics.registry, promhttp.HandlerOpts{})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		if !ok ||
+			subtle.ConstantTimeCompare([]byte(u), []byte(user)) != 1 ||
+			subtle.ConstantTimeCompare([]byte(p), []byte(pass)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Rota Metrics"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
 }

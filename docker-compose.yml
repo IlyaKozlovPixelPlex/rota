@@ -30,9 +30,12 @@ services:
     restart: unless-stopped
     ports:
       # The proxy itself is the product — keep it reachable on the host.
-      # The REST API (8001) is internal only; reach it via Caddy at /api.
+      # The REST API (8001) is internal only; reach it via Caddy at /api and /metrics.
       # The container-side port must match PROXY_PORT (the core binds to it).
       - "${PROXY_PORT:-8000}:${PROXY_PORT:-8000}"
+      # Alternative: expose the admin port directly for Prometheus scraping without Caddy.
+      # Use only on a trusted network; the /metrics handler still enforces basic auth.
+      # - "127.0.0.1:8001:8001"
     environment:
       - PROXY_PORT=${PROXY_PORT:-8000}
       - API_PORT=8001
@@ -54,6 +57,10 @@ services:
       # rate limiter's per-IP tracking. Set to false only if you expose the API
       # directly without a trusted reverse proxy (AUD-20).
       - TRUST_PROXY_HEADERS=${TRUST_PROXY_HEADERS:-true}
+      # Prometheus scrape credentials for GET /metrics.
+      # Both must be set or the endpoint returns 403 (closed by default).
+      - METRICS_BASIC_USER=${METRICS_BASIC_USER:-}
+      - METRICS_BASIC_PASSWORD=${METRICS_BASIC_PASSWORD:-}
     networks:
       - rota-network
     healthcheck:

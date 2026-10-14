@@ -7,8 +7,9 @@
 # Local (default):   SITE_ADDRESS=:80   → http://localhost
 # Production (HTTPS): SITE_ADDRESS=rota.example.com → Caddy gets a cert automatically
 {$SITE_ADDRESS::80} {
-	# API, WebSockets, Swagger docs and health → core
-	@core path /api/* /ws/* /docs /docs/* /health
+	# API, WebSockets, Swagger docs, health and Prometheus metrics → core.
+	# /metrics auth is handled by the core itself (403 when unconfigured, 401 on bad creds).
+	@core path /api/* /ws/* /docs /docs/* /health /metrics
 	handle @core {
 		reverse_proxy rota-core:8001
 	}

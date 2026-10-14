@@ -507,6 +507,49 @@ The dashboard automatically redirects to the login page with a *"Session expired
 
 ---
 
+## 📊 Prometheus Metrics
+
+Rota exposes a Prometheus scrape endpoint at `GET /metrics` on the admin port, accessible through Caddy at the same address as the dashboard.
+
+### Enabling the endpoint
+
+Set two variables in `.env` before starting the stack:
+
+```env
+METRICS_BASIC_USER=prometheus
+METRICS_BASIC_PASSWORD=a-long-random-secret
+```
+
+If either variable is unset, every request to `/metrics` returns `403` — the endpoint is **closed by default**.
+
+### Available metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `rota_requests_total` | Counter | `upstream`, `user`, `result` | Every completed proxy request (HTTP + CONNECT) |
+| `rota_connect_latency_seconds` | Histogram | `upstream` | Time to establish an upstream CONNECT tunnel |
+| `rota_upstream_fail_total` | Counter | `upstream` | Upstream connection / request failures |
+| `rota_active_tunnels` | Gauge | — | Currently active CONNECT tunnels |
+
+Label values: `upstream` = proxy address (e.g. `1.2.3.4:3128`), `user` = proxy-user name or `""` for unauthenticated, `result` = `success` or `fail`.
+
+### Prometheus scrape_config
+
+```yaml
+scrape_configs:
+  - job_name: rota
+    static_configs:
+      - targets: ['your-rota-host:80']   # Caddy port (or 443 for HTTPS)
+    metrics_path: /metrics
+    basic_auth:
+      username: prometheus
+      password: a-long-random-secret
+```
+
+For direct scraping without Caddy (e.g. local Prometheus on the same host), uncomment the `127.0.0.1:8001:8001` port mapping in `docker-compose.yml` and point Prometheus at port `8001` instead.
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! We appreciate meaningful contributions that add value to the project.

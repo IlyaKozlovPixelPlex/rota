@@ -257,8 +257,9 @@ func (s *Server) setupRoutes() {
 	// ── Fully public routes ────────────────────────────────────────────────
 	s.router.Get("/health", s.healthHandler.Health)
 
-	// Prometheus scrape endpoint — unauthenticated, same as /health.
-	// Scraped by Prometheus on the admin port (8001), not the proxy data-plane (8000).
+	// Prometheus scrape endpoint. Auth is enforced by the handler itself:
+	// 403 when METRICS_BASIC_USER/METRICS_BASIC_PASSWORD are unset, 401 on bad credentials.
+	// Caddy routes /metrics to this port; it does not add its own auth layer.
 	s.router.Handle("/metrics", proxy.MetricsHandler())
 
 	// API Documentation (public — read-only reference)
