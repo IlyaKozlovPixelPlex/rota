@@ -52,14 +52,12 @@ func connectViaSocks5(p *models.Proxy, host string) (net.Conn, error) {
 	return conn, nil
 }
 
-// connectViaHTTPStandalone sends a CONNECT request to an HTTP proxy.
-// dialTimeout covers the TCP connect; connectRespTimeout covers the CONNECT handshake.
-func connectViaHTTPStandalone(p *models.Proxy, host string) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", p.Address, dialTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("dial proxy %s: %w", p.Address, err)
-	}
-
+// sendCONNECT issues an HTTP CONNECT request over an already-dialed conn and
+// reads the proxy's response. On success the deadline is cleared and conn is
+// returned. On failure nil, err is returned WITHOUT closing conn — that is the
+// caller's responsibility. This lets pool-aware callers retry with a fresh dial
+// without a double-close.
+func sendCONNECT(conn net.Conn, p *models.Proxy, host string) (net.Conn, error) {
 	_ = conn.SetDeadline(time.Now().Add(connectRespTimeout))
 
 	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", host, host)
@@ -74,22 +72,63 @@ func connectViaHTTPStandalone(p *models.Proxy, host string) (net.Conn, error) {
 	req += "User-Agent: Rota-Proxy/1.0\r\nProxy-Connection: Keep-Alive\r\n\r\n"
 
 	if _, err := conn.Write([]byte(req)); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("send CONNECT to %s: %w", p.Address, err)
 	}
-
 	line, err := readCONNECTResponse(conn)
 	if err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("read CONNECT response from %s: %w", p.Address, err)
 	}
 	if !strings.Contains(line, "200") {
-		conn.Close()
 		return nil, fmt.Errorf("CONNECT to %s rejected: %s", p.Address, line)
 	}
-
 	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
+}
+
+// connectViaHTTPStandalone dials p.Address and issues a CONNECT for host.
+// It prefers a warm idle TCP connection from upstreamDialPool; if the pool
+// returns a dead conn the function falls back to a fresh dial transparently.
+// dialTimeout covers the TCP connect; connectRespTimeout covers the handshake.
+func connectViaHTTPStandalone(p *models.Proxy, host string) (net.Conn, error) {
+	conn := upstreamDialPool.get(p)
+	fromPool := conn != nil
+	poolConnOK := false // true only when the pool conn itself passed CONNECT
+
+	if conn == nil {
+		var err error
+		conn, err = net.DialTimeout("tcp", p.Address, dialTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("dial proxy %s: %w", p.Address, err)
+		}
+	}
+
+	tunnel, err := sendCONNECT(conn, p, host)
+	if err == nil && fromPool {
+		poolConnOK = true
+	}
+	if err != nil && fromPool {
+		// Pool conn was stale — close it, report, retry once with a fresh dial.
+		conn.Close()
+		upstreamDialPool.reportDead(p)
+		conn, err = net.DialTimeout("tcp", p.Address, dialTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("dial proxy %s: %w", p.Address, err)
+		}
+		tunnel, err = sendCONNECT(conn, p, host)
+	}
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	upstreamDialPool.reportRequest(p)
+	if poolConnOK {
+		// Only clear dead-streak when the pool conn itself succeeded, not when
+		// we fell back to a fresh dial (which would silently mask dead-pool state).
+		upstreamDialPool.reportWarmSuccess(p)
+	}
+	upstreamDialPool.maybeWarm(p)
+	return tunnel, nil
 }
 
 // readCONNECTResponse reads the upstream proxy's CONNECT reply up to the end of

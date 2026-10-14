@@ -61,6 +61,8 @@ services:
       # Both must be set or the endpoint returns 403 (closed by default).
       - METRICS_BASIC_USER=${METRICS_BASIC_USER:-}
       - METRICS_BASIC_PASSWORD=${METRICS_BASIC_PASSWORD:-}
+      # Warm upstream connection pool for CONNECT tunnels (0 = off).
+      - UPSTREAM_WARM_CONNS=${UPSTREAM_WARM_CONNS:-0}
     networks:
       - rota-network
     healthcheck:

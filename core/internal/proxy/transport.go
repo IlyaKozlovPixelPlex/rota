@@ -57,6 +57,8 @@ func GetOrCreateTransport(p *models.Proxy) (*http.Transport, error) {
 // InvalidateTransport removes any cached transport(s) for the given proxy,
 // regardless of credentials/version. Callers should invoke this when a proxy is
 // updated or deleted so the next request rebuilds with fresh settings.
+// It also drains any pre-warmed TCP connections for the same proxy so stale
+// idle connections don't survive a credential rotation.
 func InvalidateTransport(p *models.Proxy) {
 	prefix := p.Protocol + "://" + p.Address + "|"
 	transportCache.Range(func(k, _ any) bool {
@@ -65,14 +67,16 @@ func InvalidateTransport(p *models.Proxy) {
 		}
 		return true
 	})
+	upstreamDialPool.invalidate(p)
 }
 
-// ClearTransportCache drops all cached transports.
+// ClearTransportCache drops all cached transports and drains the warm dial pool.
 func ClearTransportCache() {
 	transportCache.Range(func(k, _ any) bool {
 		transportCache.Delete(k)
 		return true
 	})
+	upstreamDialPool.invalidateAll()
 }
 
 // CreateProxyTransport creates an HTTP transport configured for the given proxy
