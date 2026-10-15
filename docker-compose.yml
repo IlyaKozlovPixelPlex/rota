@@ -28,6 +28,13 @@ services:
       dockerfile: Dockerfile
     container_name: rota-core
     restart: unless-stopped
+    # High open-file limit — each concurrent CONNECT tunnel holds ~6 FDs
+    # (2 sockets + 2 splice pipes per direction). Explicit so behaviour is the
+    # same regardless of the host docker daemon's default.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     ports:
       # The proxy itself is the product — keep it reachable on the host.
       # The REST API (8001) is internal only; reach it via Caddy at /api and /metrics.
