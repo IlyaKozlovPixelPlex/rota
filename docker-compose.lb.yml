@@ -1,0 +1,118 @@
+# Deploy variant WITHOUT the bundled Caddy — front it with your own L7 load
+# balancer (TLS termination + path routing).
+#
+#   docker compose -f docker-compose.lb.yml up -d
+#
+# Your L7 LB must terminate TLS and route (all on ONE hostname/origin):
+#
+#   /api/*  /ws/*  /docs  /docs/*  /health  /metrics  ->  rota-core:8001
+#   everything else  (/, static assets)               ->  rota-dashboard:3000
+#
+#   - /ws/* needs WebSocket upgrade passthrough (dashboard realtime).
+#   - Keep dashboard + API on the SAME origin so the dashboard calls /api
+#     same-origin (no CORS). If you split them onto different origins, set
+#     NEXT_PUBLIC_API_URL (dashboard build arg) + CORS_ALLOWED_ORIGINS.
+#
+# The proxy data-plane (:8000) is SEPARATE — raw CONNECT/TCP. Front it with your
+# L4 LB (or let clients hit it directly); it does NOT go through the L7.
+#
+# Management ports (8001 = API+/metrics, 3000 = dashboard) bind to LB_BIND,
+# default 127.0.0.1 (LB on the same host). If the LB is on another host, set
+# LB_BIND to the private interface IP and firewall it to the LB only.
+
+services:
+  rota-core:
+    build:
+      context: ./core
+      dockerfile: Dockerfile
+    container_name: rota-core
+    restart: unless-stopped
+    # High open-file limit — each concurrent CONNECT tunnel holds ~6 FDs.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    ports:
+      - "${PROXY_PORT:-8000}:${PROXY_PORT:-8000}"   # proxy data-plane (L4 LB / clients)
+      - "${LB_BIND:-127.0.0.1}:8001:8001"           # REST API + /metrics -> your L7 LB
+    environment:
+      - PROXY_PORT=${PROXY_PORT:-8000}
+      - API_PORT=8001
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - DB_HOST=${DB_HOST:-timescaledb}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_USER=${DB_USER:-rota}
+      - DB_PASSWORD=${DB_PASSWORD:-rota_password}
+      - DB_NAME=${DB_NAME:-rota}
+      - DB_SSLMODE=${DB_SSLMODE:-disable}
+      - ROTA_ADMIN_USER=${ROTA_ADMIN_USER:-admin}
+      - ROTA_ADMIN_PASSWORD=${ROTA_ADMIN_PASSWORD:-}
+      - JWT_SECRET=${JWT_SECRET:-}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-*}
+      # Behind your trusted L7 LB — trust its X-Forwarded-For for login rate limiting.
+      - TRUST_PROXY_HEADERS=${TRUST_PROXY_HEADERS:-true}
+      - METRICS_BASIC_USER=${METRICS_BASIC_USER:-}
+      - METRICS_BASIC_PASSWORD=${METRICS_BASIC_PASSWORD:-}
+      - UPSTREAM_WARM_CONNS=${UPSTREAM_WARM_CONNS:-0}
+    networks:
+      - rota-network
+    healthcheck:
+      test:
+        ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  rota-dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      args:
+        # Empty → dashboard calls the API same-origin through your L7 LB.
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-}
+        - NEXT_PUBLIC_PROXY_PORT=${PROXY_PORT:-8000}
+    container_name: rota-dashboard
+    restart: unless-stopped
+    ports:
+      - "${LB_BIND:-127.0.0.1}:3000:3000"           # dashboard UI -> your L7 LB
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-}
+      - NEXT_PUBLIC_PROXY_PORT=${PROXY_PORT:-8000}
+    networks:
+      - rota-network
+    depends_on:
+      rota-core:
+        condition: service_healthy
+
+  timescaledb:
+    image: timescale/timescaledb:2.22.1-pg17
+    container_name: rota-timescaledb
+    restart: unless-stopped
+    # Port intentionally NOT exposed — DB is internal only.
+    environment:
+      - POSTGRES_USER=${DB_USER:-rota}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-rota_password}
+      - POSTGRES_DB=${DB_NAME:-rota}
+      - TIMESCALEDB_TELEMETRY=off
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    networks:
+      - rota-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-rota} -d ${DB_NAME:-rota}"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+volumes:
+  timescaledb-data:
+    driver: local
+
+networks:
+  rota-network:
+    driver: bridge
